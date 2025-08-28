@@ -1,0 +1,511 @@
+package dpebpf
+
+import (
+	"fmt"
+	"net"
+	"sync"
+	"time"
+	"unsafe"
+
+	tk "github.com/loxilb-io/loxilib"
+)
+
+/*
+#include <stdio.h>
+#include <stdlib.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <assert.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <pthread.h>
+#include <sys/syscall.h>
+#include "./../../loxilb-ebpf/kernel/loxilb_libdp.h"
+int bpf_map_get_next_key(int fd, const void *key, void *next_key);
+int bpf_map_lookup_elem(int fd, const void *key, void *value);
+extern void goMapNotiHandler(struct ll_dp_map_notif *);
+extern void goProxyEntCollector(struct dp_proxy_ct_ent *);
+extern void goLinuxArpResolver(unsigned int);
+static size_t get_sizeof_dp_ct_key() {
+    return sizeof(struct dp_ct_key);
+}
+#cgo CFLAGS:  -I./../../loxilb-ebpf/libbpf/src/ -I./../../loxilb-ebpf/common
+#cgo LDFLAGS: -L. -L/lib64 -L./../../loxilb-ebpf/kernel -L./../../loxilb-ebpf/libbpf/src/build/usr/lib64/ -Wl,-rpath=/lib64/ -l:./../../loxilb-ebpf/kernel/libloxilbdp.a -l:./../../loxilb-ebpf/libbpf/src/libbpf.a -lelf -lz -lssl -lcrypto
+*/
+import "C"
+
+type mapNoti C.struct_ll_dp_map_notif
+
+// DpCtInfo - representation of a datapath conntrack information
+type DpCtInfo struct {
+	DIP     net.IP    `json:"dip"`
+	SIP     net.IP    `json:"sip"`
+	Dport   uint16    `json:"dport"`
+	Sport   uint16    `json:"sport"`
+	Proto   string    `json:"proto"`
+	CState  string    `json:"cstate"`
+	CAct    string    `json:"cact"`
+	CI      string    `json:"ci"`
+	Packets uint64    `json:"packets"`
+	Bytes   uint64    `json:"bytes"`
+	Deleted int       `json:"deleted"`
+	PKey    []byte    `json:"pkey"`
+	PVal    []byte    `json:"pval"`
+	LTs     time.Time `json:"lts"`
+	NTs     time.Time `json:"nts"`
+	XSync   bool      `json:"xsync"`
+
+	// LB Association Data
+	ServiceIP  net.IP `json:"serviceip"`
+	ServProto  string `json:"servproto"`
+	L4ServPort uint16 `json:"l4servproto"`
+	BlockNum   uint16 `json:"blocknum"`
+	RuleID     uint32 `json:"ruleid"`
+}
+
+type Maps struct {
+	ctMap map[string]*DpCtInfo
+	mutex sync.Mutex
+}
+
+func InitMaps() *Maps {
+	m := &Maps{
+		ctMap: make(map[string]*DpCtInfo),
+		mutex: sync.Mutex{},
+	}
+	return m
+}
+
+var ctMap Maps
+
+// Key - outputs a key string for given DpCtInfo pointer
+func (ct *DpCtInfo) Key() string {
+	str := fmt.Sprintf("%s%s%d%d%s", ct.DIP.String(), ct.SIP.String(), ct.Dport, ct.Sport, ct.Proto)
+	return str
+}
+
+// String - stringify the given DpCtInfo
+func (ct *DpCtInfo) String() string {
+	str := fmt.Sprintf("%s:%d->%s:%d (%s), ", ct.SIP.String(), ct.Sport, ct.DIP.String(), ct.Dport, ct.Proto)
+	str += fmt.Sprintf("%s:%s [%v:%v]", ct.CState, ct.CAct, ct.Packets, ct.Bytes)
+	return str
+}
+
+// dpEbpfTicker - this ticker routine runs every DpEbpfLinuxTiVal seconds
+func DpEbpfTicker(t *time.Ticker) {
+
+	tbls := []int{int(C.LL_DP_RTV4_STATS_MAP),
+		int(C.LL_DP_TMAC_STATS_MAP),
+		int(C.LL_DP_BD_STATS_MAP),
+		int(C.LL_DP_TX_BD_STATS_MAP),
+		int(C.LL_DP_SESS4_STATS_MAP),
+		int(C.LL_DP_FW4_STATS_MAP)}
+	tLen := uint(len(tbls))
+	var tbN uint
+	for {
+		select {
+		case <-t.C:
+			sel := tbN % tLen
+			C.llb_collect_map_stats(C.int(tbls[sel]))
+			tbN++
+		}
+		dpCTMapChkUpdates()
+		fmt.Println(ctMap)
+	}
+}
+
+//export goMapNotiHandler
+func goMapNotiHandler(m *mapNoti) {
+	var tact *C.struct_dp_ct_tact
+	var act *C.struct_dp_ct_dat
+	ctKey := (*C.struct_dp_ct_key)(unsafe.Pointer(m.key))
+	goCtEnt := new(DpCtInfo)
+	goCtEnt.PKey = C.GoBytes(unsafe.Pointer(m.key), m.key_len)
+	if m.addop != 0 {
+		goCtEnt.PVal = C.GoBytes(unsafe.Pointer(m.val), m.val_len)
+	}
+
+	tact = (*C.struct_dp_ct_tact)(unsafe.Pointer(&goCtEnt.PKey[0]))
+	act = &tact.ctd
+	goCtEnt.convDPCt2GoObj(ctKey, act)
+	ctMap[goCtEnt.Key()] = goCtEnt
+}
+
+func SetConntracks(connkey [][]byte) {
+	for _, nextKey := range connkey {
+		var tact *C.struct_dp_ct_tact
+		var act *C.struct_dp_ct_dat
+		ctKey := (*C.struct_dp_ct_key)(unsafe.Pointer(&nextKey[0]))
+		goCtEnt := new(DpCtInfo)
+		goCtEnt.PKey = C.GoBytes(unsafe.Pointer(&nextKey[0]), C.int(C.get_sizeof_dp_ct_key()))
+		tact = (*C.struct_dp_ct_tact)(unsafe.Pointer(&goCtEnt.PKey[0]))
+		act = &tact.ctd
+		goCtEnt.convDPCt2GoObj(ctKey, act)
+		ctMap[goCtEnt.Key()] = goCtEnt
+	}
+
+}
+
+// get alreay installed conntrack info
+func GetConntracks() [][]byte {
+	fd := C.llb_map2fd(C.LL_DP_CT_MAP)
+	var result [][]byte = nil
+	var currentKey []byte = nil
+	var nextKey []byte = nil
+	nextKey = make([]byte, C.get_sizeof_dp_ct_key())
+	currentKey = make([]byte, C.get_sizeof_dp_ct_key())
+
+	for {
+		ret := C.bpf_map_get_next_key(C.int(fd), unsafe.Pointer(&currentKey[0]), unsafe.Pointer(&nextKey[0]))
+		if ret != 0 {
+			break
+		}
+		keyCopy := make([]byte, C.get_sizeof_dp_ct_key())
+		copy(keyCopy, nextKey)
+		result = append(result, keyCopy)
+		copy(currentKey, nextKey)
+	}
+	fmt.Printf("Already installed conntrack: %v\n", len(result))
+	return result
+}
+
+func dpCTMapChkUpdates() {
+	var tact C.struct_dp_ct_tact
+	var act *C.struct_dp_ct_dat
+	tc := time.Now()
+	fd := C.llb_map2fd(C.LL_DP_CT_MAP)
+
+	if len(ctMap) > 0 {
+		tk.LogIt(tk.LogInfo, "[CT] Map size %d\n", len(ctMap.ctMap))
+	}
+
+	for _, cti := range ctMap {
+		// tk.LogIt(tk.LogDebug, "[CT] check %s:%s:%v\n", cti.Key(), cti.CState, cti.XSync)
+		if cti.CState != "est" {
+			if C.bpf_map_lookup_elem(C.int(fd), unsafe.Pointer(&cti.PKey[0]), unsafe.Pointer(&tact)) != 0 {
+				delete(ctMap, cti.Key())
+				continue
+			}
+
+			act = &tact.ctd
+			goCtEnt := new(DpCtInfo)
+			goCtEnt.convDPCt2GoObj((*C.struct_dp_ct_key)(unsafe.Pointer(&cti.PKey[0])), act)
+			goCtEnt.LTs = tc
+
+			if goCtEnt.CState != cti.CState ||
+				goCtEnt.CAct != cti.CState {
+				goCtEnt.PKey = cti.PKey
+				// Key will remain the same but value might change
+				goCtEnt.PVal = C.GoBytes(unsafe.Pointer(&tact), C.sizeof_struct_dp_ct_tact)
+
+				// Copy rule associations
+				goCtEnt.ServiceIP = cti.ServiceIP
+				goCtEnt.L4ServPort = cti.L4ServPort
+				goCtEnt.BlockNum = cti.BlockNum
+				goCtEnt.ServProto = cti.ServProto
+				goCtEnt.CI = cti.CI
+				delete(ctMap, cti.Key())
+				ctMap[goCtEnt.Key()] = goCtEnt
+				ctStr := goCtEnt.String()
+				tk.LogIt(tk.LogDebug, "[CT] %s - %s\n", "update", ctStr)
+				if goCtEnt.CState == "est" {
+					goCtEnt.NTs = tc
+				}
+				continue
+			}
+		} else {
+			var b uint64
+			var p uint64
+
+			// Make sure CT shadow entries are in sync
+			if time.Duration(tc.Sub(cti.LTs).Seconds()) >= time.Duration(5*60) {
+				tk.LogIt(tk.LogInfo, "[CT] out-of-sync %s:%s:%v\n", cti.Key(), cti.CState, cti.XSync)
+				if C.bpf_map_lookup_elem(C.int(fd), unsafe.Pointer(&cti.PKey[0]), unsafe.Pointer(&tact)) != 0 {
+					tk.LogIt(tk.LogInfo, "[CT] out-of-sync not found %s:%s:%v\n", cti.Key(), cti.CState, cti.XSync)
+					delete(ctMap, cti.Key())
+					continue
+				}
+				cti.PVal = C.GoBytes(unsafe.Pointer(&tact), C.sizeof_struct_dp_ct_tact)
+				cti.LTs = tc
+			}
+
+			if len(cti.PVal) > 0 && cti.XSync == false {
+				if time.Duration(tc.Sub(cti.NTs).Seconds()) < time.Duration(60) {
+					continue
+				}
+				if C.bpf_map_lookup_elem(C.int(fd), unsafe.Pointer(&cti.PKey[0]), unsafe.Pointer(&tact)) != 0 {
+					tk.LogIt(tk.LogDebug, "[CT] ent not found %s\n", cti.Key())
+					//delete(mh.dpEbpf.ctMap, cti.Key())
+					cti.Deleted++
+					cti.XSync = true
+				} else {
+					ptact := (*C.struct_dp_ct_tact)(unsafe.Pointer(&cti.PVal[0]))
+					ret := C.llb_fetch_map_stats_cached(C.int(C.LL_DP_CT_STATS_MAP), C.uint(ptact.ca.cidx), C.int(0),
+						(unsafe.Pointer(&b)), unsafe.Pointer(&p))
+					if ret == 0 {
+						if cti.Packets != p+uint64(tact.ctd.pb.packets) {
+							cti.Bytes = b + uint64(tact.ctd.pb.bytes)
+							cti.Packets = p + uint64(tact.ctd.pb.packets)
+							cti.XSync = true
+							cti.NTs = tc
+							cti.LTs = tc
+						}
+					}
+				}
+			}
+		}
+
+	}
+
+}
+
+func (ct *DpCtInfo) convDPCt2GoObj(ctKey *C.struct_dp_ct_key, ctDat *C.struct_dp_ct_dat) *DpCtInfo {
+	return ct.convDPCt2GoObjFixup(ctKey, ctDat, false)
+}
+func (ct *DpCtInfo) convDPCt2GoObjFixup(ctKey *C.struct_dp_ct_key, ctDat *C.struct_dp_ct_dat, fixup bool) *DpCtInfo {
+	if ctKey.v6 == 0 {
+		ct.DIP = tk.NltoIP(uint32(ctKey.daddr[0]))
+		ct.SIP = tk.NltoIP(uint32(ctKey.saddr[0]))
+	} else {
+		ct.SIP = convDPv6Addr2NetIP(unsafe.Pointer(&ctKey.saddr[0]))
+		ct.DIP = convDPv6Addr2NetIP(unsafe.Pointer(&ctKey.daddr[0]))
+	}
+	ct.Dport = tk.Ntohs(uint16(ctKey.dport))
+	ct.Sport = tk.Ntohs(uint16(ctKey.sport))
+
+	p := uint8(ctKey.l4proto)
+	switch {
+	case p == 1 || p == 58:
+		if p == 1 {
+			ct.Proto = "icmp"
+		} else {
+			ct.Proto = "icmp6"
+		}
+	case p == 6:
+		ct.Proto = "tcp"
+	case p == 17:
+		ct.Proto = "udp"
+	case p == 132:
+		ct.Proto = "sctp"
+	default:
+		ct.Proto = fmt.Sprintf("%d", p)
+	}
+
+	if ctDat == nil {
+		ct.CAct = "n/a"
+		ct.CState = "closed"
+		return ct
+	}
+
+	switch {
+	case p == 1 || p == 58:
+		if p == 1 {
+			ct.Proto = "icmp"
+		} else {
+			ct.Proto = "icmp6"
+		}
+		i := (*C.ct_icmp_pinf_t)(unsafe.Pointer(&ctDat.pi))
+		switch {
+		case i.state&C.CT_ICMP_DUNR != 0:
+			ct.CState = "dest-unr"
+		case i.state&C.CT_ICMP_TTL != 0:
+			ct.CState = "ttl-exp"
+		case i.state&C.CT_ICMP_RDR != 0:
+			ct.CState = "icmp-redir"
+		case i.state == C.CT_ICMP_CLOSED:
+			ct.CState = "closed"
+		case i.state == C.CT_ICMP_REQS:
+			ct.CState = "req-sent"
+		case i.state == C.CT_ICMP_REPS:
+			ct.CState = "bidir"
+		}
+	case p == 6:
+		ct.Proto = "tcp"
+		t := (*C.ct_tcp_pinf_t)(unsafe.Pointer(&ctDat.pi))
+		switch {
+		case t.state == C.CT_TCP_CLOSED:
+			ct.CState = "closed"
+		case t.state == C.CT_TCP_SS:
+			ct.CState = "sync-sent"
+		case t.state == C.CT_TCP_SA:
+			ct.CState = "sync-ack"
+		case t.state == C.CT_TCP_EST:
+			ct.CState = "est"
+		case t.state == C.CT_TCP_ERR:
+			ct.CState = "h/e"
+		case t.state == C.CT_TCP_CW:
+			ct.CState = "closed-wait"
+		default:
+			ct.CState = "fini"
+		}
+	case p == 17:
+		ct.Proto = "udp"
+		u := (*C.ct_udp_pinf_t)(unsafe.Pointer(&ctDat.pi))
+		switch {
+		case u.state == C.CT_UDP_CNI:
+			ct.CState = "closed"
+		case u.state == C.CT_UDP_UEST:
+			ct.CState = "udp-uni"
+		case u.state == C.CT_UDP_EST:
+			ct.CState = "udp-est"
+		default:
+			ct.CState = "unk"
+		}
+	case p == 132:
+		ct.Proto = "sctp"
+		s := (*C.ct_sctp_pinf_t)(unsafe.Pointer(&ctDat.pi))
+		switch {
+		case s.state == C.CT_SCTP_PRE_EST:
+			ct.CState = "pre-est"
+		case s.state == C.CT_SCTP_EST:
+			ct.CState = "est"
+		case s.state == C.CT_SCTP_CLOSED:
+			ct.CState = "closed"
+		case s.state == C.CT_SCTP_ERR:
+			ct.CState = "err"
+		case s.state == C.CT_SCTP_INIT:
+			ct.CState = "init"
+		case s.state == C.CT_SCTP_INITA:
+			ct.CState = "init-ack"
+		case s.state == C.CT_SCTP_COOKIE:
+			ct.CState = "cookie-echo"
+		case s.state == C.CT_SCTP_COOKIEA:
+			ct.CState = "cookie-echo-resp"
+		case s.state == C.CT_SCTP_SHUT:
+			ct.CState = "shut"
+		case s.state == C.CT_SCTP_SHUTA:
+			ct.CState = "shut-ack"
+		case s.state == C.CT_SCTP_SHUTC:
+			ct.CState = "shut-complete"
+		case s.state == C.CT_SCTP_ABRT:
+			ct.CState = "abort"
+		default:
+			ct.CState = "unk"
+		}
+	default:
+		ct.Proto = fmt.Sprintf("%d", p)
+	}
+
+	ct.Packets = uint64(ctDat.pb.packets)
+	ct.Bytes = uint64(ctDat.pb.bytes)
+
+	if ctDat.xi.nat_flags == C.LLB_NAT_DST ||
+		ctDat.xi.nat_flags == C.LLB_NAT_SRC ||
+		ctDat.xi.nat_flags == C.LLB_NAT_HDST ||
+		ctDat.xi.nat_flags == C.LLB_NAT_HSRC {
+		var xip net.IP
+
+		if ctDat.xi.nv6 == 0 {
+			xip = append(xip, uint8(ctDat.xi.nat_xip[0]&0xff))
+			xip = append(xip, uint8(ctDat.xi.nat_xip[0]>>8&0xff))
+			xip = append(xip, uint8(ctDat.xi.nat_xip[0]>>16&0xff))
+			xip = append(xip, uint8(ctDat.xi.nat_xip[0]>>24&0xff))
+		} else {
+			xip = convDPv6Addr2NetIP(unsafe.Pointer(&ctDat.xi.nat_xip[0]))
+		}
+
+		port := tk.Ntohs(uint16(ctDat.xi.nat_xport))
+		if fixup {
+			if ctDat.xi.osp != 0 {
+				aSport := tk.Ntohs(uint16(ctDat.xi.osp))
+				aDport := tk.Ntohs(uint16(ctDat.xi.odp))
+				ct.CState = fmt.Sprintf("frag:%d->%d", aSport, aDport)
+			}
+		}
+
+		if ctDat.xi.nat_flags == C.LLB_NAT_DST || ctDat.xi.nat_flags == C.LLB_NAT_HDST {
+			if ctDat.xi.nat_rip[0] == 0 && ctDat.xi.nat_rip[1] == 0 &&
+				ctDat.xi.nat_rip[2] == 0 && ctDat.xi.nat_rip[3] == 0 {
+				nmode := ""
+				if ctDat.xi.dsr != 0 {
+					nmode = "ddsr"
+				} else {
+					if ctDat.xi.nat_flags == C.LLB_NAT_HDST {
+						nmode = "hdnat"
+					} else {
+						nmode = "dnat"
+					}
+				}
+				ct.CAct = fmt.Sprintf("%s-%s:%d:w%d", nmode, xip.String(), port, ctDat.xi.wprio)
+			} else {
+				var rip net.IP
+
+				if ctDat.xi.nv6 == 0 {
+					rip = append(rip, uint8(ctDat.xi.nat_rip[0]&0xff))
+					rip = append(rip, uint8(ctDat.xi.nat_rip[0]>>8&0xff))
+					rip = append(rip, uint8(ctDat.xi.nat_rip[0]>>16&0xff))
+					rip = append(rip, uint8(ctDat.xi.nat_rip[0]>>24&0xff))
+				} else {
+					rip = convDPv6Addr2NetIP(unsafe.Pointer(&ctDat.xi.nat_rip[0]))
+				}
+				ct.CAct = fmt.Sprintf("fdnat-%s,%s:%d:w%d", rip.String(), xip.String(), port, ctDat.xi.wprio)
+			}
+		} else if ctDat.xi.nat_flags == C.LLB_NAT_SRC || ctDat.xi.nat_flags == C.LLB_NAT_HSRC {
+			if ctDat.xi.nat_rip[0] == 0 && ctDat.xi.nat_rip[1] == 0 &&
+				ctDat.xi.nat_rip[2] == 0 && ctDat.xi.nat_rip[3] == 0 {
+				nmode := ""
+				if ctDat.xi.dsr != 0 {
+					nmode = "sdsr"
+				} else {
+					if ctDat.xi.nat_flags == C.LLB_NAT_HSRC {
+						nmode = "hsnat"
+					} else {
+						nmode = "snat"
+					}
+				}
+				ct.CAct = fmt.Sprintf("%s-%s:%d:w%d", nmode, xip.String(), port, ctDat.xi.wprio)
+			} else {
+				var rip net.IP
+
+				if ctDat.xi.nv6 == 0 {
+					rip = append(rip, uint8(ctDat.xi.nat_rip[0]&0xff))
+					rip = append(rip, uint8(ctDat.xi.nat_rip[0]>>8&0xff))
+					rip = append(rip, uint8(ctDat.xi.nat_rip[0]>>16&0xff))
+					rip = append(rip, uint8(ctDat.xi.nat_rip[0]>>24&0xff))
+				} else {
+					rip = convDPv6Addr2NetIP(unsafe.Pointer(&ctDat.xi.nat_rip[0]))
+				}
+				ct.CAct = fmt.Sprintf("fsnat-%s,%s:%d:w%d", xip.String(), rip.String(), port, ctDat.xi.wprio)
+			}
+		}
+	}
+
+	return ct
+}
+
+func convDPv6Addr2NetIP(addr unsafe.Pointer) net.IP {
+	var goIP net.IP
+	aPtr := (*C.uchar)(addr)
+
+	for i := 0; i < 16; i++ {
+		goIP = append(goIP, uint8(*aPtr))
+		aPtr = (*C.uchar)(getPtrOffset(unsafe.Pointer(aPtr),
+			C.sizeof_uchar))
+	}
+	return goIP
+}
+
+func getPtrOffset(ptr unsafe.Pointer, size uintptr) unsafe.Pointer {
+	return unsafe.Pointer(uintptr(ptr) + size)
+}
+
+func Start(maps *Maps, ebpfSetTime int) {
+
+	ctMap = *maps
+	var cfg C.struct_ebpfcfg
+	cfg.have_mtrace = 1
+	cfg.no_loader = 1
+	C.loxilb_main(&cfg)
+
+	// Get conntrack info from LoxiLB
+	SetConntracks(GetConntracks())
+	go DpEbpfTicker(time.NewTicker(time.Second * time.Duration(ebpfSetTime)))
+}
